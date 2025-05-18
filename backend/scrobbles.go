@@ -1,4 +1,4 @@
-package export
+package backend
 
 import (
 	"log"
@@ -20,11 +20,25 @@ type Scrobble struct {
 // ScrobbleArray is an array of scrobble objects
 type ScrobbleArray []Scrobble
 
+func FormatRow(sep string, fields []string) string {
+	rowString := fields[0]
+
+	for i, field := range fields {
+		if i == 0 {
+			continue
+		}
+
+		rowString += sep + field
+	}
+
+	return rowString
+}
+
 // ToCsv converts array of scrobble objects to csv
 func (scrobbles ScrobbleArray) ToCsv(sep string) []string {
 	csv := make([]string, len(scrobbles))
 	for i, scrobble := range scrobbles {
-		csv[i] = scrobble.Timestamp.String() + sep + scrobble.Track + sep + scrobble.Artist + sep + scrobble.Album + sep + scrobble.URL
+		csv[i] = FormatRow(sep, []string{scrobble.Timestamp.String(), scrobble.Track, scrobble.Artist, scrobble.Album, scrobble.URL})
 	}
 	return csv
 }
@@ -64,7 +78,7 @@ type recentTracksResponse struct {
 }
 
 // GetScrobbles gets user's scrobbled tracks.
-func GetScrobbles(username string, apiKey string) (tracks []Scrobble, err error) {
+func GetScrobbles(username string, apiKey string, debug bool) (tracks []Scrobble, err error) {
 	var client = http.Client{Timeout: 10 * time.Second}
 
 	resp := new(recentTracksResponse)
@@ -87,14 +101,31 @@ func GetScrobbles(username string, apiKey string) (tracks []Scrobble, err error)
 
 	log.Printf("There are %d scrobbles across %d pages\n", total, totalPages)
 
-	chunkSize := 30
 	tracks = make([]Scrobble, 0, total)
-	for i := 1; i <= totalPages; i = i + chunkSize {
-		upperBound := i + chunkSize - 1
-		if upperBound > totalPages {
-			upperBound = totalPages
+
+	// Decide chunk bounds
+	chunkSize := 30
+	startPage := 1
+	endPage := totalPages
+	if debug {
+		endPage = startPage + chunkSize - 1
+		if endPage > totalPages {
+			endPage = totalPages
 		}
-		tracks = append(tracks, getPart(&client, i, upperBound, username, apiKey)...)
+	} else {
+		// Normal chunked fetching
+		for i := 1; i <= totalPages; i += chunkSize {
+			upperBound := i + chunkSize - 1
+			if upperBound > totalPages {
+				upperBound = totalPages
+			}
+			tracks = append(tracks, getPart(&client, i, upperBound, username, apiKey)...)
+		}
+	}
+
+	// In debug mode, fetch only 1 chunk
+	if debug {
+		tracks = append(tracks, getPart(&client, startPage, endPage, username, apiKey)...)
 	}
 
 	sort.Slice(tracks, func(i, j int) bool {
