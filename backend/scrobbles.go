@@ -1,188 +1,202 @@
 package backend
 
 import (
+	"context"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
-// Scrobble is a scrobbled track.
+const (
+	baseURL               = "http://ws.audioscrobbler.com/2.0/"
+	defaultTimeout        = 15 * time.Second
+	maxConcurrentRequests = 20
+	retryCount            = 3
+	retryBackoff          = 500 * time.Millisecond
+)
+
+// Scrobble represents a single played track.
 type Scrobble struct {
+	Timestamp time.Time
 	Track     string
 	Artist    string
 	Album     string
-	Timestamp time.Time
 	URL       string
 }
 
-// ScrobbleArray is an array of scrobble objects
-type ScrobbleArray []Scrobble
-
-func FormatRow(sep string, fields []string) string {
-	rowString := fields[0]
-
-	for i, field := range fields {
-		if i == 0 {
-			continue
-		}
-
-		rowString += sep + field
-	}
-
-	return rowString
-}
-
-// ToCsv converts array of scrobble objects to csv
-func (scrobbles ScrobbleArray) ToCsv(sep string) []string {
-	csv := make([]string, len(scrobbles))
-	for i, scrobble := range scrobbles {
-		csv[i] = FormatRow(sep, []string{scrobble.Timestamp.String(), scrobble.Track, scrobble.Artist, scrobble.Album, scrobble.URL})
-	}
-	return csv
-}
-
+// recentTracksResponse models the JSON returned by Last.fm
+// Only includes fields we care about.
 type recentTracksResponse struct {
 	Recenttracks struct {
 		Attr struct {
-			Page       string `json:"page"`
-			PerPage    string `json:"perPage"`
-			User       string `json:"user"`
-			Total      string `json:"total"`
 			TotalPages string `json:"totalPages"`
 		} `json:"@attr"`
 		Track []struct {
 			Artist struct {
-				Mbid string `json:"mbid"`
 				Text string `json:"#text"`
 			} `json:"artist"`
 			Album struct {
-				Mbid string `json:"mbid"`
 				Text string `json:"#text"`
 			} `json:"album"`
-			Image []struct {
-				Size string `json:"size"`
-				Text string `json:"#text"`
-			} `json:"image"`
-			Streamable string `json:"streamable"`
-			Date       struct {
-				Uts  string `json:"uts"`
-				Text string `json:"#text"`
+			Date struct {
+				Uts string `json:"uts"`
 			} `json:"date"`
-			URL  string `json:"url"`
-			Name string `json:"name"`
-			Mbid string `json:"mbid"`
+			URL  string
+			Name string
 		} `json:"track"`
 	} `json:"recenttracks"`
 }
 
-// GetScrobbles gets user's scrobbled tracks.
-func GetScrobbles(username string, apiKey string, debug bool) (tracks []Scrobble, err error) {
-	var client = http.Client{Timeout: 10 * time.Second}
+// GetScrobblesCSV fetches all scrobbles, sorts by ascending timestamp,
+// and writes them to a tab-delimited file. Logs progress as it runs.
+func GetScrobblesCSV(username, apiKey, filename string) error {
+	client := newHTTPClient()
 
-	resp := new(recentTracksResponse)
-	getJSON(baseURL+
-		"?method=user.getrecenttracks"+
-		"&api_key="+apiKey+
-		"&format=json"+
-		"&user="+username+
-		"&page=1", &client, resp)
-
-	total, err := strconv.Atoi(resp.Recenttracks.Attr.Total)
+	// 1. Determine total pages
+	totalPages, err := getTotalPages(client, username, apiKey)
 	if err != nil {
-		return
+		return fmt.Errorf("could not determine total pages: %w", err)
 	}
+	log.Printf("Total pages to fetch: %d", totalPages)
 
-	totalPages, err := strconv.Atoi(resp.Recenttracks.Attr.TotalPages)
+	// 2. Fetch all scrobbles in parallel into slice
+	scrobbles, err := fetchAllScrobbles(client, username, apiKey, totalPages)
 	if err != nil {
-		return
+		return err
 	}
 
-	log.Printf("There are %d scrobbles across %d pages\n", total, totalPages)
-
-	tracks = make([]Scrobble, 0, total)
-
-	// Decide chunk bounds
-	chunkSize := 30
-	startPage := 1
-	endPage := totalPages
-	if debug {
-		endPage = startPage + chunkSize - 1
-		if endPage > totalPages {
-			endPage = totalPages
-		}
-	} else {
-		// Normal chunked fetching
-		for i := 1; i <= totalPages; i += chunkSize {
-			upperBound := i + chunkSize - 1
-			if upperBound > totalPages {
-				upperBound = totalPages
-			}
-			tracks = append(tracks, getPart(&client, i, upperBound, username, apiKey)...)
-		}
-	}
-
-	// In debug mode, fetch only 1 chunk
-	if debug {
-		tracks = append(tracks, getPart(&client, startPage, endPage, username, apiKey)...)
-	}
-
-	sort.Slice(tracks, func(i, j int) bool {
-		return tracks[i].Timestamp.Before(tracks[j].Timestamp)
+	// 3. Sort by timestamp ascending
+	sort.Slice(scrobbles, func(i, j int) bool {
+		return scrobbles[i].Timestamp.Before(scrobbles[j].Timestamp)
 	})
+	log.Printf("Total records fetched: %d", len(scrobbles))
 
-	return tracks, nil
+	// 4. Write to tab-delimited file
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	w := csv.NewWriter(file)
+	w.Comma = '\t'
+	// header
+	w.Write([]string{"timestamp", "track", "artist", "album", "url"})
+
+	for _, s := range scrobbles {
+		w.Write([]string{s.Timestamp.UTC().Format(time.RFC3339), s.Track, s.Artist, s.Album, s.URL})
+	}
+	w.Flush()
+
+	log.Printf("Scrobbles written to %s", filename)
+	return nil
 }
 
-func getPart(client *http.Client, firstPage int, lastPage int, username string, apiKey string) []Scrobble {
-	messages := make(chan *recentTracksResponse)
-
-	for i := firstPage; i <= lastPage; i++ {
-		go getPage(i, client, messages, username, apiKey)
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: defaultTimeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: maxConcurrentRequests,
+			IdleConnTimeout:     90 * time.Second,
+		},
 	}
-
-	// Writing down the way the standard time would look like formatted our way
-	// Standard time is "Jan 2 15:04:05 MST 2006  (MST is GMT-0700)"
-	layout := "02 Jan 2006, 15:04"
-
-	var tracks []Scrobble
-	for i := firstPage; i <= lastPage; i++ {
-		resp := <-messages
-		ts := resp.Recenttracks.Track
-		for _, track := range ts {
-			scrobbleTime, _ := time.Parse(layout, track.Date.Text)
-			t := Scrobble{
-				Track:     track.Name,
-				Artist:    track.Artist.Text,
-				Album:     track.Album.Text,
-				Timestamp: scrobbleTime,
-				URL:       track.URL,
-			}
-			tracks = append(tracks, t)
-		}
-	}
-	return tracks
 }
 
-func getPage(page int, client *http.Client, c chan *recentTracksResponse, username string, apiKey string) {
+func getTotalPages(client *http.Client, user, key string) (int, error) {
 	resp := new(recentTracksResponse)
-	i := 1
-	for {
-		getJSON(baseURL+
-			"?method=user.getrecenttracks"+
-			"&api_key="+apiKey+
-			"&format=json"+
-			"&user="+username+
-			"&page="+strconv.Itoa(page), client, resp)
-
-		if len(resp.Recenttracks.Track) > 0 {
-			log.Printf("OK scrobbles page %d\n", page)
-			c <- resp
-			break
-		}
-
-		log.Printf("RETRY %-2d scrobbles page %d\n", i, page)
-		i++
+	url := buildURL(user, key, 1)
+	if err := doGetJSON(url, client, resp); err != nil {
+		return 0, err
 	}
+	pages, err := strconv.Atoi(resp.Recenttracks.Attr.TotalPages)
+	if err != nil {
+		return 0, err
+	}
+	return pages, nil
+}
+
+func fetchAllScrobbles(
+	client *http.Client,
+	user, key string,
+	totalPages int,
+) ([]Scrobble, error) {
+	ctx := context.Background()
+	sem := semaphore.NewWeighted(maxConcurrentRequests)
+	var eg errgroup.Group
+	var mu sync.Mutex
+	sc := make([]Scrobble, 0, totalPages*50)
+
+	for p := 1; p <= totalPages; p++ {
+		p := p
+		if err := sem.Acquire(ctx, 1); err != nil {
+			return nil, err
+		}
+		eg.Go(func() error {
+			defer sem.Release(1)
+
+			log.Printf("Fetching page %d/%d", p, totalPages)
+			resp := new(recentTracksResponse)
+			if err := doGetJSON(buildURL(user, key, p), client, resp); err != nil {
+				return fmt.Errorf("page %d: %w", p, err)
+			}
+
+			// parse into Scrobble
+			var local []Scrobble
+			for _, t := range resp.Recenttracks.Track {
+				tsInt, _ := strconv.ParseInt(t.Date.Uts, 10, 64)
+				local = append(local, Scrobble{
+					Timestamp: time.Unix(tsInt, 0).UTC(),
+					Track:     t.Name,
+					Artist:    t.Artist.Text,
+					Album:     t.Album.Text,
+					URL:       t.URL,
+				})
+			}
+			log.Printf("Page %d: parsed %d records", p, len(local))
+
+			mu.Lock()
+			sc = append(sc, local...)
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	return sc, nil
+}
+
+// doGetJSON wraps HTTP GET + JSON decode with retries/backoff
+func doGetJSON(url string, client *http.Client, target interface{}) error {
+	var lastErr error
+	for i := 1; i <= retryCount; i++ {
+		r, err := client.Get(url)
+		if err == nil && r.StatusCode == http.StatusOK {
+			defer r.Body.Close()
+			return json.NewDecoder(r.Body).Decode(target)
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("status %d", r.StatusCode)
+		}
+		time.Sleep(retryBackoff)
+	}
+	return fmt.Errorf("GET %s failed after %d attempts: %w", url, retryCount, lastErr)
+}
+
+func buildURL(user, key string, page int) string {
+	return fmt.Sprintf("%s?method=user.getrecenttracks&user=%s&api_key=%s&format=json&page=%d", baseURL, user, key, page)
 }
